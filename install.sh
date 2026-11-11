@@ -14,6 +14,10 @@
 #   COMPANION_BLE_ADDRESS, volitelně WEB_PORT, TZ, ADMIN_USER.
 set -euo pipefail
 
+# Vše je ve funkci main (volá se na konci), aby bash při „curl … | bash“ načetl celý skript
+# dřív, než cokoli spustí – jinak by příkazy čtoucí stdin (docker exec) spolkly zbytek skriptu.
+main() {
+
 GITHUB="${MESHCORE_GITHUB:-https://github.com/pmalecek}"
 STACK_REF="${STACK_REF:-main}"
 DIR="${MESHCORE_DIR:-$HOME/meshcore-stack}"
@@ -106,7 +110,7 @@ if ! docker info >/dev/null 2>&1; then
     fi
 fi
 "${DOCKER[@]}" compose version >/dev/null 2>&1 || die "Chybí Docker Compose v2 (balíček docker-compose-plugin)."
-dc() { (cd "$DIR" && "${DOCKER[@]}" compose "$@"); }
+dc() { (cd "$DIR" && "${DOCKER[@]}" compose "$@") < /dev/null; }
 
 # ---------------------------------------------------------------- soubory stacku
 
@@ -203,7 +207,7 @@ if [ -z "$(env_get MC_SERVER_TOKEN)" ]; then
     info "Propojuji klienta se serverem (API token)"
     token=""
     for _ in $(seq 1 30); do
-        out="$(dc exec -T meshcore-server meshcore-server token create "meshcore-klient-$(date +%s)" --scope admin 2>&1 || true)"
+        out="$(cd "$DIR" && timeout 60 "${DOCKER[@]}" compose exec -T meshcore-server meshcore-server token create "meshcore-klient-$(date +%s)" --scope admin < /dev/null 2>&1 || true)"
         token="$(printf '%s\n' "$out" | grep -oE 'mcs_[A-Za-z0-9_-]+' | head -1 || true)"
         [ -n "$token" ] && break
         sleep 3
@@ -219,17 +223,18 @@ dc up -d --remove-orphans
 # uživatel webu (jen při první instalaci)
 ADMIN_PW=""
 ADMIN_USER="$(env_get ADMIN_USER)"; ADMIN_USER="${ADMIN_USER:-admin}"
-if [ "$FIRST" = 1 ]; then
+# uživatel webu – jen když zatím žádný není (první instalace nebo přerušená instalace)
+users=""
+for _ in $(seq 1 40); do
+    if users="$(dc exec -T klient-web php bin/user.php list 2>/dev/null)"; then break; fi
+    users="?"; sleep 3
+done
+if [ -z "$users" ]; then
     ADMIN_PW="$(gen_pw 16)"
-    for _ in $(seq 1 30); do
-        if dc exec -T klient-web php bin/user.php add "$ADMIN_USER" "--password=$ADMIN_PW" >/dev/null 2>&1; then
-            break
-        fi
-        if dc exec -T klient-web php bin/user.php list 2>/dev/null | grep -q "^$ADMIN_USER "; then
-            ADMIN_PW="(uživatel už existoval – heslo se nezměnilo)"; break
-        fi
-        sleep 3
-    done
+    dc exec -T klient-web php bin/user.php add "$ADMIN_USER" "--password=$ADMIN_PW" >/dev/null \
+        || { warn "Uživatele se nepodařilo vytvořit – vytvoř ho ručně (viz README)."; ADMIN_PW=""; }
+elif [ "$users" = "?" ]; then
+    warn "Klient zatím neodpovídá – uživatele vytvoř ručně: docker compose exec klient-web php bin/user.php add admin --password=…"
 fi
 
 # ---------------------------------------------------------------- shrnutí
@@ -252,3 +257,7 @@ echo "  Stav:      cd $DIR && docker compose ps"
 echo "  Logy:      cd $DIR && docker compose logs -f meshcore-server klient-worker"
 echo "  Aktualizace: spusť instalační příkaz znovu"
 echo
+
+}
+
+main "$@"
