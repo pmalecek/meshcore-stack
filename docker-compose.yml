@@ -1,0 +1,107 @@
+# MeshCore stack: meshcore-server + meshcore-klient + MariaDB.
+# Nastavení je v souboru .env (vytvoří ho install.sh). Způsob připojení companionu
+# (WiFi/TCP, USB, Bluetooth) přidává doplňkový soubor compose.<transport>.yml – viz COMPOSE_FILE v .env.
+
+x-klient-env: &klient-env
+  MC_DB_HOST: db
+  MC_DB_NAME: meshcore_klient
+  MC_DB_USER: meshcore_klient
+  MC_DB_PASSWORD: ${KLIENT_DB_PASSWORD:?chybí v .env}
+  MC_BACKEND: server
+  MC_SERVER_URL: http://meshcore-server:8080
+  MC_SERVER_TOKEN: ${MC_SERVER_TOKEN:-}
+  MC_SERVER_READER: klient
+  MC_TIMEZONE: ${TZ:-Europe/Prague}
+  MC_NODE_NAME: ${NODE_NAME:-}
+  TZ: ${TZ:-Europe/Prague}
+
+services:
+  db:
+    image: mariadb:11.8
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?chybí v .env}
+      KLIENT_DB_PASSWORD: ${KLIENT_DB_PASSWORD:?chybí v .env}
+      SERVER_DB_PASSWORD: ${SERVER_DB_PASSWORD:?chybí v .env}
+      TZ: ${TZ:-Europe/Prague}
+    volumes:
+      - db-data:/var/lib/mysql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  meshcore-server:
+    build: ./src/meshcore-server
+    image: meshcore-server:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+      MCS_DATABASE__DRIVER: mysql
+      MCS_DATABASE__MYSQL__HOST: db
+      MCS_DATABASE__MYSQL__PORT: "3306"
+      MCS_DATABASE__MYSQL__DATABASE: meshcore_server
+      MCS_DATABASE__MYSQL__USER: meshcore_server
+      MCS_DATABASE__MYSQL__PASSWORD: ${SERVER_DB_PASSWORD:?chybí v .env}
+    volumes:
+      - server-data:/data
+    # API serveru je jen uvnitř Dockeru. Pro jiné klienty ho zpřístupníš odkomentováním:
+    # ports:
+    #   - "8081:8080"
+
+  klient-web:
+    build: ./src/meshcore-klient
+    image: meshcore-klient:local
+    command: ["web"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: *klient-env
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    volumes:
+      - klient-data:/app/data
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1/login.php') === false ? 1 : 0);"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  klient-worker:
+    image: meshcore-klient:local
+    pull_policy: never
+    command: ["worker"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      meshcore-server:
+        condition: service_started
+      klient-web:
+        condition: service_started
+    environment: *klient-env
+
+  klient-heard:
+    image: meshcore-klient:local
+    pull_policy: never
+    command: ["heard"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      klient-web:
+        condition: service_started
+    environment: *klient-env
+
+volumes:
+  db-data:
+  server-data:
+  klient-data:

@@ -1,0 +1,7 @@
+# Companion připojený přes WiFi (TCP).
+services:
+  meshcore-server:
+    environment:
+      MCS_COMPANION__TRANSPORT: tcp
+      MCS_COMPANION__TCP__HOST: ${COMPANION_HOST:?chybí COMPANION_HOST v .env}
+      MCS_COMPANION__TCP__PORT: ${COMPANION_PORT:-5000}

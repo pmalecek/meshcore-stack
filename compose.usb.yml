@@ -1,0 +1,13 @@
+# Companion připojený přes USB (sériový port). Zařízení se předá do kontejneru serveru.
+services:
+  meshcore-server:
+    environment:
+      MCS_COMPANION__TRANSPORT: serial
+      MCS_COMPANION__SERIAL__PORT: /dev/meshcore
+      MCS_COMPANION__SERIAL__BAUDRATE: ${COMPANION_BAUDRATE:-115200}
+    devices:
+      - "${COMPANION_DEVICE:?chybí COMPANION_DEVICE v .env}:/dev/meshcore"
+    # server v kontejneru běží jako uživatel 1000 – přístup k portu dává skupina, které zařízení patří
+    # (install.sh ji zjistí; obvykle dialout = 20)
+    group_add:
+      - "${COMPANION_DEVICE_GID:-20}"

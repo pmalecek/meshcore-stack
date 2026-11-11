@@ -1,0 +1,5 @@
+# nastavení s hesly a tokenem
+.env
+# stažené zdrojáky klienta a serveru
+src/
+.stack-new/

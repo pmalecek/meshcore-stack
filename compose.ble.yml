@@ -1,0 +1,15 @@
+# Companion přes Bluetooth (BLE) – pokročilé, viz docs/ble.md.
+# Kontejner používá Bluetooth hostitele přes D-Bus (BlueZ musí běžet na hostiteli).
+services:
+  meshcore-server:
+    environment:
+      MCS_COMPANION__TRANSPORT: ble
+      MCS_COMPANION__BLE__ADDRESS: ${COMPANION_BLE_ADDRESS:-}
+      MCS_COMPANION__BLE__PIN: ${COMPANION_BLE_PIN:-}
+    volumes:
+      - /run/dbus:/run/dbus:ro
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    security_opt:
+      - apparmor:unconfined
