@@ -200,7 +200,12 @@ info "Sestavuji image (poprvé to může trvat několik minut, na Raspberry Pi i
 dc build --pull
 
 info "Spouštím databázi a meshcore-server"
-dc up -d db meshcore-server
+# --wait: počkat, až je server zdravý (má hotové schéma DB) – teprve pak se smí vytvářet token,
+# jinak by se zakládání schématu serverem a příkazem „token create“ srazilo.
+if ! dc up -d --wait --wait-timeout 300 db meshcore-server; then
+    dc logs --tail=30 meshcore-server >&2 || true
+    die "meshcore-server se nespustil – viz výpis výše."
+fi
 
 # API token klienta pro server (jen jednou)
 if [ -z "$(env_get MC_SERVER_TOKEN)" ]; then
