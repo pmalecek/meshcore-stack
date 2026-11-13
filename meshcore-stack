@@ -38,6 +38,14 @@ ok()   { echo "${c_ok}✔${c_0} $*"; }
 warn() { echo "${c_warn}!${c_0} $*" >&2; }
 die()  { echo "${c_err}✘ $*${c_0}" >&2; exit 1; }
 
+# whiptail kreslí podle locale: bez UTF-8 (časté přes SSH, např. LANG=cs_CZ.UTF-8 z Macu,
+# které na serveru není vygenerované) by rozbil diakritiku -> zvolit dostupné UTF-8 locale
+if [ "$(locale charmap 2>/dev/null)" != UTF-8 ]; then
+    _loc="$(locale -a 2>/dev/null | grep -iE '^(c|cs_cz|en_us|en_gb)\.utf-?8$' | head -1 || true)"
+    if [ -n "$_loc" ]; then export LC_ALL="$_loc"; else MESHCORE_PLAIN=1; fi
+    unset _loc
+fi
+
 TTY=/dev/tty
 has_tty() { [ -r "$TTY" ] && [ -w "$TTY" ] && { : < "$TTY"; } 2>/dev/null; }
 WT=""
