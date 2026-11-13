@@ -11,7 +11,7 @@ Stack běží v Linuxu uvnitř Windows (WSL 2) s Docker Desktopem.
    *Settings → Resources → WSL integration → Ubuntu*.
 3. **Otevři Ubuntu** (nabídka Start → Ubuntu) a spusť stejný příkaz jako na Linuxu:
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/pmalecek/meshcore-stack/main/install.sh | bash
+   curl -fsSL "https://raw.githubusercontent.com/pmalecek/meshcore-stack/main/install.sh?$(date +%s)" | bash
    ```
 4. Web otevři ve Windows na `http://localhost:8080/` (adresa, kterou instalátor vypíše, platí uvnitř WSL;
    z Windows funguje `localhost`).

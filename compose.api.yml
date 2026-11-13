@@ -1,0 +1,6 @@
+# API meshcore-serveru dostupné i mimo Docker (pro další aplikace).
+# Zapíná se příkazem: meshcore-stack api on [port]
+services:
+  meshcore-server:
+    ports:
+      - "${SERVER_API_PORT:-8081}:8080"

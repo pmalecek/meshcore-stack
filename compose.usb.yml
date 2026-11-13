@@ -8,6 +8,6 @@ services:
     devices:
       - "${COMPANION_DEVICE:?chybí COMPANION_DEVICE v .env}:/dev/meshcore"
     # server v kontejneru běží jako uživatel 1000 – přístup k portu dává skupina, které zařízení patří
-    # (install.sh ji zjistí; obvykle dialout = 20)
+    # (meshcore-stack ji zjistí; obvykle dialout = 20)
     group_add:
       - "${COMPANION_DEVICE_GID:-20}"

@@ -1,5 +1,5 @@
 # MeshCore stack: meshcore-server + meshcore-klient + MariaDB.
-# Nastavení je v souboru .env (vytvoří ho install.sh). Způsob připojení companionu
+# Nastavení je v souboru .env (vytvoří ho meshcore-stack install). Způsob připojení companionu
 # (WiFi/TCP, USB, Bluetooth) přidává doplňkový soubor compose.<transport>.yml – viz COMPOSE_FILE v .env.
 
 x-klient-env: &klient-env
@@ -51,9 +51,7 @@ services:
       MCS_DATABASE__MYSQL__PASSWORD: ${SERVER_DB_PASSWORD:?chybí v .env}
     volumes:
       - server-data:/data
-    # API serveru je jen uvnitř Dockeru. Pro jiné klienty ho zpřístupníš odkomentováním:
-    # ports:
-    #   - "8081:8080"
+    # API serveru je jen uvnitř Dockeru. Pro další aplikace: meshcore-stack api on (compose.api.yml)
 
   klient-web:
     build: ./src/meshcore-klient

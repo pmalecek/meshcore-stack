@@ -1,0 +1,809 @@
+#!/usr/bin/env bash
+# MeshCore stack – správa instalace (meshcore-server + meshcore-klient + MariaDB v Dockeru).
+#
+#   meshcore-stack              menu v terminálu
+#   meshcore-stack status       stav kontejnerů, verze, companion
+#   meshcore-stack update       aktualizace (předtím automatická záloha)
+#   meshcore-stack backup       záloha do backups/ (ponechá poslední 3)
+#   meshcore-stack restore SOUBOR
+#   meshcore-stack start | stop | restart
+#   meshcore-stack logs [služba]
+#   meshcore-stack companion    změna připojení companionu
+#   meshcore-stack api on [port] | off
+#   meshcore-stack token NÁZEV [read|write|admin]   token pro další aplikaci
+#   meshcore-stack user list | add JMÉNO [HESLO] | passwd JMÉNO [HESLO] | delete JMÉNO | totp JMÉNO
+#   meshcore-stack uninstall    odinstalace (nejdřív záloha)
+#
+# Proměnné prostředí: MESHCORE_DIR (složka instalace), STACK_REF (verze stacku, výchozí main),
+# YES=1 (bez potvrzování, např. pro cron: YES=1 meshcore-stack update), MESHCORE_PLAIN=1 (bez whiptailu).
+set -euo pipefail
+
+# Verze klienta a serveru pro KLIENT_REF=auto / SERVER_REF=auto (mění se s vydáním stacku)
+DEFAULT_KLIENT_REF="v1.0.4"
+DEFAULT_SERVER_REF="v0.11.0"
+BACKUP_KEEP=3
+
+GITHUB="${MESHCORE_GITHUB:-https://github.com/pmalecek}"
+STACK_REF="${STACK_REF:-main}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="${MESHCORE_DIR:-$(dirname "$SELF")}"
+TITLE="MeshCore stack"
+
+# ---------------------------------------------------------------- výpis
+
+c_ok=$'\e[32m'; c_warn=$'\e[33m'; c_err=$'\e[31m'; c_b=$'\e[1m'; c_0=$'\e[0m'
+[ -t 1 ] || { c_ok=; c_warn=; c_err=; c_b=; c_0=; }
+info() { echo "${c_b}==>${c_0} $*"; }
+ok()   { echo "${c_ok}✔${c_0} $*"; }
+warn() { echo "${c_warn}!${c_0} $*" >&2; }
+die()  { echo "${c_err}✘ $*${c_0}" >&2; exit 1; }
+
+TTY=/dev/tty
+has_tty() { [ -r "$TTY" ] && [ -w "$TTY" ] && { : < "$TTY"; } 2>/dev/null; }
+WT=""
+if has_tty && command -v whiptail >/dev/null 2>&1 && [ "${MESHCORE_PLAIN:-0}" != 1 ]; then WT=whiptail; fi
+
+# ---------------------------------------------------------------- dialogy (whiptail, jinak text)
+
+# ui_menu "text" tag popis tag popis … -> REPLY=tag (prázdné = zpět)
+ui_menu() {
+    local text="$1"; shift
+    has_tty || { REPLY=""; return 0; }
+    if [ -n "$WT" ]; then
+        REPLY="$(whiptail --title "$TITLE" --cancel-button "Zpět" --ok-button "Vybrat" \
+            --menu "$text" 22 72 12 "$@" 3>&1 1>&2 2>&3 < "$TTY" > "$TTY")" || REPLY=""
+        return 0
+    fi
+    # textový režim: položky očíslované, přijme číslo i název
+    local tags=() i=0
+    { echo; echo "$text"
+      while [ $# -gt 0 ]; do
+          tags+=("$1"); i=$((i + 1))
+          if [ "$1" = "$i" ]; then printf '  %2s) %s\n' "$i" "$2"; else printf '  %2s) %s\n' "$i" "$2 [$1]"; fi
+          shift 2
+      done
+      printf 'Volba (Enter = zpět): '; } > "$TTY"
+    IFS= read -r REPLY < "$TTY" || REPLY=""
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le ${#tags[@]} ]; then
+        REPLY="${tags[$((REPLY - 1))]}"
+    fi
+}
+
+ui_yesno() { # ui_yesno "otázka" -> 0 = ano
+    [ "${YES:-0}" = 1 ] && return 0
+    if [ -n "$WT" ]; then
+        whiptail --title "$TITLE" --yes-button "Ano" --no-button "Ne" --yesno "$1" 14 72 < "$TTY" > "$TTY"
+        return $?
+    fi
+    has_tty || return 1
+    printf '%s (a/n): ' "$1" > "$TTY"
+    local a; IFS= read -r a < "$TTY" || a=""
+    case "$a" in a|A|ano|y|Y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+ui_input() { # ui_input "otázka" "výchozí" -> REPLY (návrat 1 = zrušeno)
+    local q="$1" def="${2:-}"
+    if [ -n "$WT" ]; then
+        REPLY="$(whiptail --title "$TITLE" --cancel-button "Zrušit" --inputbox "$q" 10 72 "$def" 3>&1 1>&2 2>&3 < "$TTY" > "$TTY")" || return 1
+        return 0
+    fi
+    if ! has_tty; then REPLY="$def"; return 0; fi
+    if [ -n "$def" ]; then printf '%s [%s]: ' "$q" "$def" > "$TTY"; else printf '%s: ' "$q" > "$TTY"; fi
+    IFS= read -r REPLY < "$TTY" || REPLY=""
+    REPLY="${REPLY:-$def}"
+}
+
+ui_password() { # ui_password "otázka" -> REPLY
+    if [ -n "$WT" ]; then
+        REPLY="$(whiptail --title "$TITLE" --cancel-button "Zrušit" --passwordbox "$1" 10 72 3>&1 1>&2 2>&3 < "$TTY" > "$TTY")" || return 1
+        return 0
+    fi
+    has_tty || return 1
+    printf '%s: ' "$1" > "$TTY"
+    stty -echo < "$TTY" 2>/dev/null || true
+    IFS= read -r REPLY < "$TTY" || REPLY=""
+    stty echo < "$TTY" 2>/dev/null || true
+    echo > "$TTY"
+}
+
+ui_msg() { # ui_msg "text"
+    if [ -n "$WT" ]; then
+        whiptail --title "$TITLE" --msgbox "$1" 20 76 < "$TTY" > "$TTY" || true
+    else
+        echo; echo "$1"; echo
+    fi
+}
+
+ui_text() { # ui_text soubor – delší výpis s posuvníkem
+    if [ -n "$WT" ]; then
+        whiptail --title "$TITLE" --scrolltext --textbox "$1" 24 90 < "$TTY" > "$TTY" || true
+    else
+        cat "$1"
+    fi
+}
+
+pause() { if has_tty && [ -z "$WT" ]; then printf 'Enter = pokračovat… ' > "$TTY"; read -r _ < "$TTY" || true; fi; }
+
+# ---------------------------------------------------------------- .env
+
+env_get() { [ -f "$DIR/.env" ] || return 0; grep -E "^$1=" "$DIR/.env" | tail -1 | cut -d= -f2- || true; }
+
+env_set() {
+    local k="$1" v="$2"
+    if grep -qE "^$k=" "$DIR/.env" 2>/dev/null; then
+        local tmp; tmp="$(mktemp)"
+        awk -v k="$k" -v v="$v" -F= 'BEGIN{OFS="="} $1==k {print k, v; next} {print}' "$DIR/.env" > "$tmp"
+        cat "$tmp" > "$DIR/.env"; rm -f "$tmp"
+    else
+        echo "$k=$v" >> "$DIR/.env"
+    fi
+}
+
+gen_pw() { LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-24}" || true; }
+
+# KLIENT_REF / SERVER_REF: „auto“ = verze, kterou určuje tento skript (aktualizuje se se stackem)
+ref() {
+    local v; v="$(env_get "$1")"
+    if [ -z "$v" ] || [ "$v" = auto ]; then
+        [ "$1" = KLIENT_REF ] && echo "$DEFAULT_KLIENT_REF" || echo "$DEFAULT_SERVER_REF"
+    else
+        echo "$v"
+    fi
+}
+
+compose_files() { # COMPOSE_FILE podle připojení companionu a API
+    local f="docker-compose.yml:compose.$(env_get COMPANION_TRANSPORT).yml"
+    [ "$(env_get API_ENABLED)" = 1 ] && f="$f:compose.api.yml"
+    env_set COMPOSE_FILE "$f"
+}
+
+# ---------------------------------------------------------------- Docker
+
+DOCKER=(docker)
+docker_init() {
+    command -v docker >/dev/null || return 1
+    if ! docker info >/dev/null 2>&1; then
+        if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && sudo docker info >/dev/null 2>&1; then
+            DOCKER=(sudo docker)
+        else
+            die "Docker neběží nebo k němu nemáš přístup (sudo systemctl start docker)."
+        fi
+    fi
+    "${DOCKER[@]}" compose version >/dev/null 2>&1 || die "Chybí Docker Compose v2 (balíček docker-compose-plugin)."
+    # stručnější výpis (starší Compose --progress quiet nezná)
+    if "${DOCKER[@]}" compose --progress quiet version >/dev/null 2>&1; then QUIET=(--progress quiet); fi
+}
+QUIET=()
+
+# docker compose ve složce stacku; stdin z /dev/null (jinak by při „curl | bash“ spolkl skript)
+dc() { (cd "$DIR" && "${DOCKER[@]}" compose "$@") < /dev/null; }
+dcq() { (cd "$DIR" && "${DOCKER[@]}" compose "${QUIET[@]}" "$@") < /dev/null; } # bez průběhu (up, stop…)
+dc_tty() { (cd "$DIR" && "${DOCKER[@]}" compose "$@"); } # interaktivní (logy, QR)
+
+need_installed() { [ -f "$DIR/.env" ] || die "MeshCore stack není ve složce $DIR nainstalovaný."; }
+
+db_sql() { # db_sql "SQL" [databáze] – výsledek bez hlaviček
+    dc exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -B '"${2:-}"' -e "$0"' "$1" 2>/dev/null
+}
+
+running() { dc ps --status running --services 2>/dev/null | grep -qx "$1"; }
+
+# ---------------------------------------------------------------- stažení
+
+download() { # download REPO REF CÍL
+    local repo="$1" ref="$2" dest="$3" tmp
+    tmp="$(mktemp -d)"
+    info "Stahuji $repo ($ref)"
+    if ! curl -fsSL "$GITHUB/$repo/archive/$ref.tar.gz" -o "$tmp/src.tar.gz"; then
+        rm -rf "$tmp"; die "Nepodařilo se stáhnout $repo verze $ref. Existuje na GitHubu (tag nebo větev)?"
+    fi
+    rm -rf "$dest"; mkdir -p "$dest"
+    tar -xzf "$tmp/src.tar.gz" -C "$dest" --strip-components=1
+    rm -rf "$tmp"
+}
+
+stack_files() { # nová verze souborů stacku (bez .env, zdrojáků a záloh)
+    local tmp; tmp="$(mktemp -d)"
+    download meshcore-stack "$STACK_REF" "$tmp/stack"
+    (cd "$tmp/stack" && tar -cf - --exclude=./.env --exclude=./src --exclude=./backups .) | (cd "$DIR" && tar -xf -)
+    rm -rf "$tmp"
+    chmod +x "$DIR/meshcore-stack" "$DIR/install.sh" "$DIR/db/init/"*.sh 2>/dev/null || true
+}
+
+link_command() { # příkaz meshcore-stack do PATH
+    local target=/usr/local/bin/meshcore-stack
+    if [ "$(id -u)" -ne 0 ]; then
+        if [ -w /usr/local/bin ]; then :
+        elif command -v sudo >/dev/null && sudo -n true 2>/dev/null; then
+            sudo ln -sf "$DIR/meshcore-stack" "$target" && return 0
+        else
+            mkdir -p "$HOME/.local/bin"; target="$HOME/.local/bin/meshcore-stack"
+        fi
+    fi
+    ln -sf "$DIR/meshcore-stack" "$target" 2>/dev/null || warn "Příkaz se nepodařilo zapsat do $target."
+}
+
+# ---------------------------------------------------------------- připojení companionu
+
+configure_companion() {
+    local t="${COMPANION_TRANSPORT:-}"
+    if [ -z "$t" ]; then
+        local cur; cur="$(env_get COMPANION_TRANSPORT)"
+        ui_menu "Jak je připojený MeshCore companion?" \
+            tcp "WiFi (TCP) – companion s WiFi firmwarem (doporučeno)" \
+            usb "USB kabelem k tomuto počítači" \
+            ble "Bluetooth (pokročilé, viz docs/ble.md)"
+        t="${REPLY:-${cur:-tcp}}"
+    fi
+    case "$t" in tcp|usb|ble) ;; *) die "Neznámé připojení: $t" ;; esac
+    env_set COMPANION_TRANSPORT "$t"
+    case "$t" in
+        tcp)
+            local host="${COMPANION_HOST:-}" port="${COMPANION_PORT:-}"
+            if [ -z "$host" ]; then ui_input "IP adresa companionu" "$(env_get COMPANION_HOST)" || return 1; host="$REPLY"; fi
+            [ -n "$host" ] || die "IP adresa companionu je povinná."
+            if [ -z "$port" ]; then ui_input "TCP port companionu" "$(env_get COMPANION_PORT || true)"; port="${REPLY:-5000}"; fi
+            env_set COMPANION_HOST "$host"; env_set COMPANION_PORT "${port:-5000}" ;;
+        usb)
+            local dev="${COMPANION_DEVICE:-}" found
+            found="$(ls /dev/serial/by-id/* /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -1 || true)"
+            if [ -z "$dev" ]; then ui_input "Sériový port companionu" "${found:-/dev/ttyUSB0}" || return 1; dev="$REPLY"; fi
+            [ -e "$dev" ] || warn "Zařízení $dev teď neexistuje – zkontroluj, že je companion připojený."
+            env_set COMPANION_DEVICE "$dev"
+            env_set COMPANION_DEVICE_GID "$(stat -Lc %g "$dev" 2>/dev/null || echo 20)" ;;
+        ble)
+            local mac="${COMPANION_BLE_ADDRESS:-}" pin="${COMPANION_BLE_PIN:-}"
+            if [ -z "$mac" ]; then ui_input "MAC adresa companionu (prázdné = vyhledat)" "$(env_get COMPANION_BLE_ADDRESS)" || return 1; mac="$REPLY"; fi
+            if [ -z "$pin" ]; then ui_input "PIN pro spárování (prázdné = bez PINu)" "$(env_get COMPANION_BLE_PIN)" || return 1; pin="$REPLY"; fi
+            env_set COMPANION_BLE_ADDRESS "$mac"; env_set COMPANION_BLE_PIN "$pin"
+            warn "Bluetooth v Dockeru vyžaduje BlueZ na hostiteli – projdi docs/ble.md." ;;
+    esac
+    compose_files
+}
+
+cmd_companion() {
+    need_installed; docker_init
+    configure_companion || return 0
+    info "Používám nové nastavení companionu"
+    dcq up -d --remove-orphans
+    ok "Hotovo. Server se ke companionu připojí do minuty."
+}
+
+# ---------------------------------------------------------------- instalace / aktualizace
+
+# sestavení a spuštění; volá instalace i aktualizace
+deploy() {
+    local kref sref
+    kref="$(ref KLIENT_REF)"; sref="$(ref SERVER_REF)"
+    download meshcore-server "$sref" "$DIR/src/meshcore-server"
+    download meshcore-klient "$kref" "$DIR/src/meshcore-klient"
+    [ -f "$DIR/src/meshcore-klient/Dockerfile" ] || die "Klient verze $kref nemá Dockerfile – je potřeba novější verze."
+
+    info "Sestavuji image (poprvé to může trvat několik minut, na Raspberry Pi i 15 minut)"
+    dc build --pull
+
+    info "Spouštím databázi a meshcore-server"
+    # --wait: server musí mít hotové schéma DB, než se vytvoří token (jinak by se zakládání srazilo)
+    if ! dcq up -d --wait --wait-timeout 300 db meshcore-server; then
+        dc logs --tail=30 meshcore-server >&2 || true
+        die "meshcore-server se nespustil – viz výpis výše."
+    fi
+
+    if [ -z "$(env_get MC_SERVER_TOKEN)" ]; then
+        info "Propojuji klienta se serverem (API token)"
+        local token="" out=""
+        for _ in $(seq 1 30); do
+            out="$(cd "$DIR" && timeout 60 "${DOCKER[@]}" compose exec -T meshcore-server meshcore-server token create "meshcore-klient-$(date +%s)" --scope admin < /dev/null 2>&1 || true)"
+            token="$(printf '%s\n' "$out" | grep -oE 'mcs_[A-Za-z0-9_-]+' | head -1 || true)"
+            [ -n "$token" ] && break
+            sleep 3
+        done
+        [ -n "$token" ] || { printf '%s\n' "$out" >&2; die "Token se nepodařilo vytvořit – viz 'docker compose logs meshcore-server'."; }
+        env_set MC_SERVER_TOKEN "$token"
+        ok "Token vytvořen a uložen do .env"
+    fi
+
+    info "Spouštím klienta"
+    dcq up -d --remove-orphans
+    env_set KLIENT_DEPLOYED "$kref"
+    env_set SERVER_DEPLOYED "$sref"
+}
+
+ADMIN_PW=""
+ensure_admin() { # uživatel webu, když zatím žádný není
+    local users="" user
+    user="$(env_get ADMIN_USER)"; user="${user:-admin}"
+    for _ in $(seq 1 40); do
+        if users="$(dc exec -T klient-web php bin/user.php list 2>/dev/null)"; then break; fi
+        users="?"; sleep 3
+    done
+    if [ -z "$users" ]; then
+        ADMIN_PW="$(gen_pw 16)"
+        dc exec -T klient-web php bin/user.php add "$user" "--password=$ADMIN_PW" >/dev/null \
+            || { warn "Uživatele se nepodařilo vytvořit – vytvoř ho v menu Uživatelé."; ADMIN_PW=""; }
+    elif [ "$users" = "?" ]; then
+        warn "Klient zatím neodpovídá – uživatele vytvoř v menu Uživatelé."
+    fi
+}
+
+summary() {
+    local ip port user
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; port="$(env_get WEB_PORT)"
+    user="$(env_get ADMIN_USER)"; user="${user:-admin}"
+    echo
+    ok "${c_b}MeshCore stack běží.${c_0}"
+    echo
+    echo "  Web:       http://${ip:-localhost}:${port:-8080}/"
+    if [ -n "$ADMIN_PW" ]; then
+        echo "  Uživatel:  $user"
+        echo "  Heslo:     $ADMIN_PW"
+        echo
+        echo "  ${c_warn}Heslo si ulož – znovu se nezobrazí.${c_0} Změníš ho v klientu: menu ⋮ → Heslo k přihlášení."
+    fi
+    echo
+    echo "  Správa:    meshcore-stack   (menu: stav, aktualizace, zálohy, uživatelé…)"
+    echo "  Složka:    $DIR"
+    echo
+}
+
+cmd_install() {
+    command -v curl >/dev/null || die "Chybí curl."
+    docker_init || die "Docker není nainstalovaný."
+    mkdir -p "$DIR"
+    if [ -f "$DIR/.env" ]; then
+        info "Instalace v $DIR už existuje – spouštím aktualizaci"
+        cmd_update_stage2 noask
+        return
+    fi
+    info "První instalace do $DIR"
+    : > "$DIR/.env"; chmod 600 "$DIR/.env"
+    { echo "# MeshCore stack – nastavení (vytvořeno $(date '+%Y-%m-%d %H:%M'))"
+      echo "# Po ruční změně spusť: meshcore-stack restart"; } >> "$DIR/.env"
+    env_set KLIENT_REF auto
+    env_set SERVER_REF auto
+    configure_companion || die "Instalace zrušena."
+    local port="${WEB_PORT:-}"
+    if [ -z "$port" ]; then ui_input "Port webového rozhraní" "8080" || die "Instalace zrušena."; port="$REPLY"; fi
+    local tz="${TZ:-$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo Europe/Prague)}"
+    env_set WEB_PORT "${port:-8080}"
+    env_set TZ "${tz:-Europe/Prague}"
+    env_set NODE_NAME ""
+    env_set DB_ROOT_PASSWORD "$(gen_pw 32)"
+    env_set KLIENT_DB_PASSWORD "$(gen_pw 32)"
+    env_set SERVER_DB_PASSWORD "$(gen_pw 32)"
+    env_set MC_SERVER_TOKEN ""
+    env_set ADMIN_USER "${ADMIN_USER:-admin}"
+    env_set API_ENABLED 0
+    env_set SERVER_API_PORT 8081
+    compose_files
+    deploy
+    ensure_admin
+    link_command
+    summary
+}
+
+# starší instalace (z install.sh před správcem): doplnit nové volby
+migrate_env() {
+    # instalace z původního install.sh měly verze napevno – nově je určuje správce (auto)
+    if ! grep -qE '^KLIENT_DEPLOYED=' "$DIR/.env"; then
+        env_set KLIENT_DEPLOYED "$(env_get KLIENT_REF)"
+        env_set SERVER_DEPLOYED "$(env_get SERVER_REF)"
+        env_set KLIENT_REF auto
+        env_set SERVER_REF auto
+    fi
+    grep -qE '^API_ENABLED=' "$DIR/.env" || {
+        if grep -qE '^COMPOSE_FILE=.*compose\.api\.yml' "$DIR/.env"; then env_set API_ENABLED 1; else env_set API_ENABLED 0; fi
+    }
+    grep -qE '^SERVER_API_PORT=' "$DIR/.env" || env_set SERVER_API_PORT 8081
+}
+
+cmd_update() {
+    need_installed; docker_init
+    info "Stahuji aktuální verzi stacku"
+    stack_files
+    # pokračovat novou verzí tohoto skriptu (může mít novější výchozí verze klienta a serveru)
+    exec "$DIR/meshcore-stack" _update-stage2
+}
+
+cmd_update_stage2() { # $1 = noask
+    need_installed; docker_init
+    migrate_env
+    local kref sref kcur scur
+    kref="$(ref KLIENT_REF)"; sref="$(ref SERVER_REF)"
+    kcur="$(env_get KLIENT_DEPLOYED)"; scur="$(env_get SERVER_DEPLOYED)"
+    local msg="meshcore-klient:  ${kcur:-?}  →  $kref
+meshcore-server:  ${scur:-?}  →  $sref
+
+Před aktualizací se automaticky vytvoří záloha.
+Pokračovat?"
+    if [ "${1:-}" != noask ] && [ "$kcur" = "$kref" ] && [ "$scur" = "$sref" ]; then
+        msg="Klient ($kref) i server ($sref) jsou v aktuální verzi.
+
+Přesto je znovu sestavit a spustit (např. po ručních úpravách)?"
+    fi
+    if [ "${1:-}" = noask ] || [ "${YES:-0}" = 1 ] || ! has_tty; then echo "$msg" | sed 's/^/  /'; fi
+    if [ "${1:-}" != noask ]; then ui_yesno "$msg" || { info "Aktualizace zrušena."; return 0; }; fi
+    if running db; then cmd_backup quiet || warn "Zálohu se nepodařilo vytvořit – pokračuji bez ní."; fi
+    compose_files
+    deploy
+    ensure_admin
+    link_command
+    summary
+}
+
+# ---------------------------------------------------------------- stav
+
+cmd_status() {
+    need_installed; docker_init
+    local f; f="$(mktemp)"
+    {
+        echo "MeshCore stack v $DIR"
+        echo
+        echo "Verze:   klient $(env_get KLIENT_DEPLOYED) (cíl $(ref KLIENT_REF)), server $(env_get SERVER_DEPLOYED) (cíl $(ref SERVER_REF))"
+        local t; t="$(env_get COMPANION_TRANSPORT)"
+        case "$t" in
+            tcp) echo "Companion: WiFi $(env_get COMPANION_HOST):$(env_get COMPANION_PORT)" ;;
+            usb) echo "Companion: USB $(env_get COMPANION_DEVICE)" ;;
+            ble) echo "Companion: Bluetooth $(env_get COMPANION_BLE_ADDRESS)" ;;
+        esac
+        echo "Web:     port $(env_get WEB_PORT)$( [ "$(env_get API_ENABLED)" = 1 ] && echo ", API serveru na portu $(env_get SERVER_API_PORT)")"
+        if running db; then
+            local st
+            st="$(db_sql "SELECT k, v FROM worker_state WHERE k IN ('worker_connected','companion_connected','last_event_at')" meshcore_klient || true)"
+            echo "Klient → server:     $(printf '%s\n' "$st" | awk '$1=="worker_connected"{print ($2=="1"?"připojen":"NEPŘIPOJEN")}')"
+            echo "Server → companion:  $(printf '%s\n' "$st" | awk '$1=="companion_connected"{print ($2=="1"?"připojen":"NEPŘIPOJEN")}')"
+            local le; le="$(printf '%s\n' "$st" | awk '$1=="last_event_at"{print $2}')"
+            [ -n "$le" ] && le="$(date -d "$le" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$le")"
+            echo "Poslední událost:    ${le:-–}"
+            echo
+            echo "Databáze:"
+            db_sql "SELECT table_schema, CONCAT(ROUND(SUM(data_length+index_length)/1048576,1),' MB') FROM information_schema.tables WHERE table_schema IN ('meshcore_klient','meshcore_server') GROUP BY table_schema" \
+                | awk '{printf "  %-18s %s %s\n", $1, $2, $3}' || true
+            echo "  zpráv v klientu:   $(db_sql 'SELECT COUNT(*) FROM messages' meshcore_klient || echo ?)"
+        fi
+        echo
+        echo "Zálohy ($DIR/backups):"
+        ls -1t "$DIR/backups"/*.tar.gz 2>/dev/null | head -"$BACKUP_KEEP" | while read -r b; do
+            printf '  %s  %s\n' "$(basename "$b")" "$(du -h "$b" | cut -f1)"
+        done || true
+        [ -n "$(ls "$DIR/backups"/*.tar.gz 2>/dev/null)" ] || echo "  žádné"
+        echo
+        echo "Kontejnery:"
+        dc ps --format 'table {{.Service}}\t{{.Status}}' 2>/dev/null | sed 's/^/  /'
+    } > "$f" 2>&1
+    if [ -n "$WT" ] && [ "${1:-}" = menu ]; then ui_text "$f"; else cat "$f"; fi
+    rm -f "$f"
+}
+
+# ---------------------------------------------------------------- zálohy
+
+cmd_backup() { # $1 = quiet
+    need_installed; docker_init
+    running db || die "Databáze neběží (meshcore-stack start)."
+    mkdir -p "$DIR/backups"; chmod 700 "$DIR/backups"
+    local name tmp
+    name="meshcore-$(date +%Y%m%d-%H%M%S)"
+    tmp="$(mktemp -d)"; mkdir -p "$tmp/$name"
+    info "Zálohuji databáze"
+    dc exec -T db sh -c 'mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --single-transaction --routines --databases meshcore_server meshcore_klient' \
+        > "$tmp/$name/databases.sql" || { rm -rf "$tmp"; die "Záloha databází selhala."; }
+    cp "$DIR/.env" "$tmp/$name/env"
+    if running klient-web; then
+        dc exec -T klient-web tar -C /app -cf - data > "$tmp/$name/klient-data.tar" 2>/dev/null || rm -f "$tmp/$name/klient-data.tar"
+    fi
+    if running meshcore-server; then
+        dc exec -T meshcore-server tar -C / -cf - data > "$tmp/$name/server-data.tar" 2>/dev/null || rm -f "$tmp/$name/server-data.tar"
+    fi
+    {
+        echo "Záloha MeshCore stacku $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "klient $(env_get KLIENT_DEPLOYED), server $(env_get SERVER_DEPLOYED)"
+    } > "$tmp/$name/INFO.txt"
+    (umask 077; tar -C "$tmp" -czf "$DIR/backups/$name.tar.gz" "$name")
+    rm -rf "$tmp"
+    # ponechat posledních BACKUP_KEEP
+    ls -1t "$DIR/backups"/meshcore-*.tar.gz 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))" | xargs -r rm -f
+    ok "Záloha: $DIR/backups/$name.tar.gz ($(du -h "$DIR/backups/$name.tar.gz" | cut -f1))"
+    [ "${1:-}" = quiet ] || [ -z "$WT" ] || ui_msg "Záloha vytvořena:
+$DIR/backups/$name.tar.gz
+
+Obsahuje obě databáze, nastavení (.env včetně hesel) a data klienta.
+Ponechávají se poslední $BACKUP_KEEP zálohy."
+}
+
+cmd_restore() {
+    need_installed; docker_init
+    local file="${1:-}"
+    if [ -z "$file" ]; then
+        local items=() b
+        while read -r b; do items+=("$(basename "$b")" "$(du -h "$b" | cut -f1)"); done \
+            < <(ls -1t "$DIR/backups"/*.tar.gz 2>/dev/null)
+        [ ${#items[@]} -gt 0 ] || { ui_msg "Ve složce $DIR/backups nejsou žádné zálohy."; return 0; }
+        ui_menu "Kterou zálohu obnovit?" "${items[@]}"
+        [ -n "$REPLY" ] || return 0
+        file="$DIR/backups/$REPLY"
+    fi
+    [ -f "$file" ] || die "Záloha $file neexistuje."
+    ui_yesno "Obnovit zálohu $(basename "$file")?
+
+Současné zprávy, kontakty a nastavení v databázích se nahradí obsahem zálohy.
+Připojení companionu a hesla k databázi zůstanou současné." || return 0
+
+    local tmp d
+    tmp="$(mktemp -d)"
+    tar -xzf "$file" -C "$tmp"
+    d="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    [ -f "$d/databases.sql" ] || { rm -rf "$tmp"; die "Záloha neobsahuje databases.sql."; }
+
+    info "Zastavuji klienta a server"
+    dcq stop klient-web klient-worker klient-heard meshcore-server >/dev/null 2>&1 || true
+    dcq up -d --wait db
+    info "Obnovuji databáze"
+    # dump obsahuje CREATE DATABASE; uživatelé a jejich práva (s aktuálními hesly) zůstávají
+    db_sql "DROP DATABASE IF EXISTS meshcore_server; DROP DATABASE IF EXISTS meshcore_klient;" >/dev/null || true
+    (cd "$DIR" && "${DOCKER[@]}" compose exec -T db sh -c 'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"') < "$d/databases.sql" \
+        || { rm -rf "$tmp"; die "Obnova databází selhala."; }
+    # token klienta patří k databázi serveru ze zálohy
+    local tok; tok="$(grep -E '^MC_SERVER_TOKEN=' "$d/env" | cut -d= -f2- || true)"
+    [ -n "$tok" ] && env_set MC_SERVER_TOKEN "$tok"
+    dcq up -d --remove-orphans
+    sleep 3
+    if [ -f "$d/server-data.tar" ]; then
+        (cd "$DIR" && "${DOCKER[@]}" compose exec -T meshcore-server tar -C / -xf -) < "$d/server-data.tar" || warn "Data serveru se nepodařilo obnovit."
+    fi
+    if [ -f "$d/klient-data.tar" ]; then
+        (cd "$DIR" && "${DOCKER[@]}" compose exec -T klient-web sh -c 'rm -rf /app/data/* && tar -C /app -xf - && chown -R www-data:www-data /app/data') < "$d/klient-data.tar" || warn "Data klienta (pozadí) se nepodařilo obnovit."
+    fi
+    rm -rf "$tmp"
+    ok "Záloha obnovena."
+    [ -z "$WT" ] || ui_msg "Záloha $(basename "$file") obnovena."
+}
+
+# ---------------------------------------------------------------- uživatelé webu
+
+cmd_user() {
+    need_installed; docker_init
+    local action="${1:-}" name="${2:-}" pw="${3:-}"
+    case "$action" in
+        list) dc exec -T klient-web php bin/user.php list ;;
+        add)
+            [ -n "$name" ] || die "Použití: meshcore-stack user add JMÉNO [HESLO]"
+            local gen=0; [ -n "$pw" ] || { pw="$(gen_pw 16)"; gen=1; }
+            dc exec -T klient-web php bin/user.php add "$name" "--password=$pw" | grep -v 'bin/user.php reset' || true
+            [ "$gen" = 1 ] && echo "Heslo: $pw"
+            echo "Přihlašování kódem z aplikace (TOTP): meshcore-stack user totp $name"
+            ;;
+        passwd)
+            [ -n "$name" ] || die "Použití: meshcore-stack user passwd JMÉNO [HESLO]"
+            local gen=0; [ -n "$pw" ] || { pw="$(gen_pw 16)"; gen=1; }
+            dc exec -T klient-web php bin/user.php passwd "$name" "--password=$pw"
+            [ "$gen" = 1 ] && echo "Nové heslo: $pw"
+            ;;
+        delete) [ -n "$name" ] || die "Použití: meshcore-stack user delete JMÉNO"; dc exec -T klient-web php bin/user.php delete "$name" ;;
+        totp)
+            [ -n "$name" ] || die "Použití: meshcore-stack user totp JMÉNO"
+            local out uri
+            out="$(dc exec -T klient-web php bin/user.php reset "$name" 2>&1)" || die "$out"
+            printf '%s\n' "$out" | grep -v "^Tip:"
+            uri="$(printf '%s\n' "$out" | sed -n 's/^URI: *//p')"
+            if [ -n "$uri" ] && command -v qrencode >/dev/null; then qrencode -t ANSIUTF8 "$uri"
+            else echo "(QR kód: nainstaluj na tomto počítači 'qrencode' – apt install qrencode)"; fi
+            ;;
+        *) die "Použití: meshcore-stack user list | add JMÉNO [HESLO] | passwd JMÉNO [HESLO] | delete JMÉNO | totp JMÉNO" ;;
+    esac
+}
+
+menu_users() {
+    while true; do
+        ui_menu "Uživatelé webového rozhraní" \
+            list "Seznam uživatelů" \
+            add "Přidat uživatele (vygeneruje heslo)" \
+            passwd "Nové heslo (vygeneruje, nebo zadáš své)" \
+            totp "Přihlašování kódem z aplikace (TOTP)" \
+            delete "Smazat uživatele"
+        local a="$REPLY" f out
+        [ -n "$a" ] || return 0
+        f="$(mktemp)"
+        case "$a" in
+            list) cmd_user list > "$f" 2>&1 || true; [ -s "$f" ] || echo "Zatím žádní uživatelé." > "$f"; ui_text "$f" ;;
+            add)
+                ui_input "Jméno nového uživatele" "" || { rm -f "$f"; continue; }
+                [ -n "$REPLY" ] || { rm -f "$f"; continue; }
+                cmd_user add "$REPLY" > "$f" 2>&1 || true; ui_text "$f" ;;
+            passwd)
+                ui_input "Uživatel" "$(env_get ADMIN_USER)" || { rm -f "$f"; continue; }
+                local u="$REPLY"
+                ui_password "Nové heslo (aspoň 10 znaků; prázdné = vygenerovat)" || { rm -f "$f"; continue; }
+                cmd_user passwd "$u" "$REPLY" > "$f" 2>&1 || true; ui_text "$f" ;;
+            totp)
+                ui_input "Uživatel" "$(env_get ADMIN_USER)" || { rm -f "$f"; continue; }
+                local u="$REPLY"
+                ui_yesno "Vytvořit pro $u nový klíč pro aplikaci (Google Authenticator, Aegis…)?
+Starý klíč přestane platit. Heslo zůstává." || { rm -f "$f"; continue; }
+                clear 2>/dev/null || true
+                cmd_user totp "$u" || true
+                pause_always ;;
+            delete)
+                ui_input "Koho smazat" "" || { rm -f "$f"; continue; }
+                [ -n "$REPLY" ] || { rm -f "$f"; continue; }
+                local u="$REPLY"
+                ui_yesno "Opravdu smazat uživatele $u?" && { cmd_user delete "$u" > "$f" 2>&1 || true; ui_text "$f"; } ;;
+        esac
+        rm -f "$f"
+    done
+}
+
+pause_always() { has_tty && { printf '\nEnter = zpět do menu… ' > "$TTY"; read -r _ < "$TTY" || true; }; }
+
+# ---------------------------------------------------------------- ostatní
+
+cmd_api() {
+    need_installed; docker_init
+    local what="${1:-}" port="${2:-}"
+    case "$what" in
+        on)  env_set API_ENABLED 1; [ -n "$port" ] && env_set SERVER_API_PORT "$port" ;;
+        off) env_set API_ENABLED 0 ;;
+        *) die "Použití: meshcore-stack api on [port] | off" ;;
+    esac
+    compose_files
+    dcq up -d --remove-orphans
+    if [ "$what" = on ]; then
+        ok "API serveru je dostupné na http://$(hostname -I 2>/dev/null | awk '{print $1}'):$(env_get SERVER_API_PORT)/api/v1/"
+        echo "  Token pro aplikaci: meshcore-stack token NÁZEV [read|write|admin]"
+    else
+        ok "API serveru je zase jen uvnitř Dockeru."
+    fi
+}
+
+menu_api() {
+    local st port; st="$(env_get API_ENABLED)"; port="$(env_get SERVER_API_PORT)"
+    if [ "$st" = 1 ]; then
+        ui_menu "API serveru je zpřístupněné na portu ${port:-8081}." off "Vypnout (jen uvnitř Dockeru)" port "Změnit port" token "Vytvořit token pro aplikaci"
+    else
+        ui_menu "API serveru je teď jen uvnitř Dockeru (pro klienta).
+Zpřístupni ho, pokud s ním má komunikovat další aplikace." on "Zpřístupnit" token "Vytvořit token pro aplikaci"
+    fi
+    case "$REPLY" in
+        on|port) ui_input "Port API na tomto počítači" "${port:-8081}" || return 0; cmd_api on "$REPLY"; pause_always ;;
+        off) cmd_api off; pause_always ;;
+        token)
+            ui_input "Název aplikace (např. home-assistant)" "" || return 0
+            local n="$REPLY"; [ -n "$n" ] || return 0
+            ui_menu "Oprávnění tokenu" read "jen čtení" write "čtení a odesílání zpráv (doporučeno)" admin "vše včetně správy uzlu"
+            [ -n "$REPLY" ] || return 0
+            clear 2>/dev/null || true
+            cmd_token "$n" "$REPLY" || true
+            pause_always ;;
+    esac
+}
+
+cmd_token() {
+    need_installed; docker_init
+    [ -n "${1:-}" ] || die "Použití: meshcore-stack token NÁZEV [read|write|admin]"
+    dc exec -T meshcore-server meshcore-server token create "$1" --scope "${2:-write}"
+}
+
+cmd_logs() {
+    need_installed; docker_init
+    echo "Ctrl+C = konec výpisu"
+    trap 'true' INT
+    dc_tty logs -f --tail=100 "$@" || true
+    trap - INT
+}
+
+menu_logs() {
+    ui_menu "Čí log zobrazit? (Ctrl+C = konec)" \
+        meshcore-server "server – spojení s companionem" \
+        klient-worker "klient – napojení na server" \
+        klient-web "webové rozhraní" \
+        klient-heard "kontrola heard (analyzer)" \
+        db "databáze" \
+        all "všechno"
+    [ -n "$REPLY" ] || return 0
+    clear 2>/dev/null || true
+    if [ "$REPLY" = all ]; then cmd_logs; else cmd_logs "$REPLY"; fi
+}
+
+cmd_start()   { need_installed; docker_init; dcq up -d --remove-orphans; ok "Spuštěno."; }
+cmd_stop()    { need_installed; docker_init; dcq stop; ok "Zastaveno. (Po restartu počítače se znovu nespustí – spusť 'meshcore-stack start'.)"; }
+cmd_restart() { need_installed; docker_init; compose_files; dcq up -d --remove-orphans; dcq restart; ok "Restartováno."; }
+
+cmd_uninstall() {
+    need_installed; docker_init
+    ui_yesno "Odinstalovat MeshCore stack?
+
+Smažou se kontejnery, image a data (zprávy, kontakty, nastavení).
+Předtím se vytvoří záloha, která zůstane v ~/meshcore-stack-zalohy." || return 0
+    if [ "${YES:-0}" != 1 ]; then
+        ui_input "Pro potvrzení napiš: smazat" "" || return 0
+        [ "$REPLY" = smazat ] || { info "Odinstalace zrušena."; return 0; }
+    fi
+    local keep="$HOME/meshcore-stack-zalohy"
+    if running db; then cmd_backup quiet || warn "Zálohu se nepodařilo vytvořit."; fi
+    if [ -n "$(ls "$DIR/backups"/*.tar.gz 2>/dev/null)" ]; then
+        mkdir -p "$keep"; chmod 700 "$keep"; mv "$DIR/backups"/*.tar.gz "$keep/"
+    fi
+    info "Mažu kontejnery, data a image"
+    dcq down -v --rmi all --remove-orphans || true
+    local l
+    for l in /usr/local/bin/meshcore-stack "$HOME/.local/bin/meshcore-stack"; do
+        [ "$(readlink -f "$l" 2>/dev/null)" = "$SELF" ] || continue
+        rm -f "$l" 2>/dev/null || sudo rm -f "$l" 2>/dev/null || true
+    done
+    local d="$DIR"; cd /
+    rm -rf "$d"
+    ok "MeshCore stack odinstalován."
+    [ -d "$keep" ] && echo "  Zálohy zůstaly v $keep (obnova: nainstaluj stack a v menu zvol Obnova ze zálohy)."
+}
+
+# ---------------------------------------------------------------- menu
+
+menu() {
+    need_installed; docker_init
+    while true; do
+        local st=""
+        if running db; then
+            case "$(db_sql "SELECT v FROM worker_state WHERE k = 'companion_connected'" meshcore_klient || true)" in
+                1) st="companion připojen" ;; *) st="companion NEPŘIPOJEN" ;;
+            esac
+        else
+            st="zastaveno"
+        fi
+        ui_menu "Instalace: $DIR   ($st)" \
+            1 "Stav" \
+            2 "Aktualizace" \
+            3 "Připojení companionu" \
+            4 "Uživatelé webu" \
+            5 "Záloha" \
+            6 "Obnova ze zálohy" \
+            7 "Logy" \
+            8 "Spustit / zastavit / restart" \
+            9 "API serveru pro další aplikace" \
+            10 "Odinstalace"
+        case "$REPLY" in
+            1) cmd_status menu; [ -n "$WT" ] || pause ;;
+            2) clear 2>/dev/null || true; ( cmd_update ) || true; pause_always ;;
+            3) ( cmd_companion ) || true; pause_always ;;
+            4) menu_users ;;
+            5) clear 2>/dev/null || true; ( cmd_backup ) || true; [ -n "$WT" ] || pause ;;
+            6) ( cmd_restore ) || true; pause_always ;;
+            7) menu_logs ;;
+            8)
+                ui_menu "Kontejnery" start "Spustit" stop "Zastavit" restart "Restartovat"
+                case "$REPLY" in
+                    start) cmd_start; pause_always ;; stop) cmd_stop; pause_always ;; restart) cmd_restart; pause_always ;;
+                esac ;;
+            9) menu_api ;;
+            10) ( cmd_uninstall ) && { [ -d "$DIR" ] || exit 0; }; pause_always ;;
+            "") clear 2>/dev/null || true; return 0 ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------- hlavní
+
+main() {
+    local cmd="${1:-}"; shift || true
+    case "$cmd" in
+        "")
+            if has_tty; then menu; else cmd_status; fi ;;
+        install)        cmd_install ;;
+        update)         cmd_update ;;
+        _update-stage2) cmd_update_stage2 ;;
+        status)         cmd_status ;;
+        backup)         cmd_backup ;;
+        restore)        cmd_restore "$@" ;;
+        user|users)     cmd_user "$@" ;;
+        companion)      cmd_companion ;;
+        api)            cmd_api "$@" ;;
+        token)          cmd_token "$@" ;;
+        logs)           cmd_logs "$@" ;;
+        start)          cmd_start ;;
+        stop)           cmd_stop ;;
+        restart)        cmd_restart ;;
+        uninstall)      cmd_uninstall ;;
+        -h|--help|help) sed -n '2,18p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+        *) die "Neznámý příkaz '$cmd' – viz meshcore-stack help" ;;
+    esac
+}
+
+main "$@"

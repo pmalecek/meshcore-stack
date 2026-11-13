@@ -10,56 +10,73 @@ na počítači stačí Docker.
 Na Linuxu (PC, server, Raspberry Pi, kontejner v Proxmoxu) spusť v terminálu nebo přes SSH:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pmalecek/meshcore-stack/main/install.sh | bash
+curl -fsSL "https://raw.githubusercontent.com/pmalecek/meshcore-stack/main/install.sh?$(date +%s)" | bash
 ```
 
 Instalátor:
 
-1. zkontroluje Docker (když chybí, nabídne jeho instalaci),
-2. zeptá se, jak je připojený companion (WiFi a jeho IP adresa, USB, nebo Bluetooth) a na port webu,
-3. stáhne klienta a server a sestaví je (poprvé pár minut, na Raspberry Pi i 15 minut),
-4. spustí databázi, server a klienta a propojí je,
-5. vytvoří uživatele webu a vypíše adresu, jméno a **heslo – ulož si ho, znovu se nezobrazí**.
+1. zkontroluje Docker,
+2. stáhne stack do `~/meshcore-stack` a zpřístupní příkaz `meshcore-stack`,
+3. zeptá se, jak je připojený companion (WiFi a jeho IP adresa, USB, nebo Bluetooth) a na port webu,
+4. stáhne klienta a server a sestaví je (poprvé pár minut, na Raspberry Pi i 15 minut),
+5. spustí databázi, server a klienta a propojí je,
+6. vytvoří uživatele webu a vypíše adresu, jméno a **heslo – ulož si ho, znovu se nezobrazí**.
 
 Pak otevři v prohlížeči vypsanou adresu, např. `http://192.168.1.50:8080/`.
 
-Instaluje se do `~/meshcore-stack` (jinou složku nastavíš proměnnou `MESHCORE_DIR`).
+Jinou složku nastavíš proměnnou `MESHCORE_DIR`. Dialogy v terminálu používají `whiptail`
+(`sudo apt install whiptail`), bez něj se instalátor ptá obyčejným textem.
 
 **Windows:** návod v [docs/windows.md](docs/windows.md). **USB:** [docs/usb.md](docs/usb.md). **Bluetooth:** [docs/ble.md](docs/ble.md).
 
-## Aktualizace
+## Správa: příkaz `meshcore-stack`
 
-Spusť instalační příkaz znovu. Stáhne a sestaví nové verze, data, nastavení i uživatelé zůstanou. Na nic se neptá.
-Verze klienta a serveru jsou v `.env` (`KLIENT_REF`, `SERVER_REF`); nový instalátor může přinést novější výchozí.
+Bez parametrů otevře menu:
 
-Změna připojení companionu (např. jiná IP adresa):
+| Položka | Co dělá |
+|---|---|
+| Stav | verze, spojení se serverem a companionem, velikost databází, zálohy, kontejnery |
+| Aktualizace | stáhne nový stack, ukáže změnu verzí, **zazálohuje** a sestaví nové verze |
+| Připojení companionu | změna WiFi / USB / Bluetooth, IP adresy, portu |
+| Uživatelé webu | seznam, přidání, nové heslo, přihlašování kódem (TOTP, s QR kódem, je-li `qrencode`), smazání |
+| Záloha / Obnova | záloha do `~/meshcore-stack/backups` (ponechají se poslední 3), obnova vybrané zálohy |
+| Logy | výpis logu vybraného kontejneru |
+| Spustit / zastavit / restart | |
+| API serveru | zpřístupnění API meshcore-serveru dalším aplikacím na zvoleném portu, vytvoření tokenu |
+| Odinstalace | nejdřív záloha (přesune se do `~/meshcore-stack-zalohy`), pak smaže kontejnery, data i složku |
 
-```bash
-cd ~/meshcore-stack
-nano .env                  # COMPANION_HOST=…
-docker compose up -d
-```
-
-nebo instalátor s `RECONFIGURE=1`, který se znovu zeptá:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/pmalecek/meshcore-stack/main/install.sh | RECONFIGURE=1 bash
-```
-
-## Běžné příkazy
-
-Ve složce `~/meshcore-stack`:
+Totéž z příkazové řádky (i pro cron):
 
 ```bash
-docker compose ps                                  # stav kontejnerů
-docker compose logs -f meshcore-server             # log serveru (spojení s companionem)
-docker compose logs -f klient-worker               # log klienta
-docker compose restart                             # restart všeho
-docker compose down                                # zastavení (data zůstanou)
-docker compose exec klient-web php bin/user.php add petr --password=TajneHeslo123   # další uživatel
-docker compose exec klient-web php bin/user.php list
-docker compose exec -it klient-web php bin/user.php reset admin   # přihlašování kódem (TOTP), vypíše klíč pro aplikaci
+meshcore-stack status
+meshcore-stack update                 # YES=1 meshcore-stack update = bez potvrzení
+meshcore-stack backup
+meshcore-stack restore ~/meshcore-stack/backups/meshcore-20261113-0300.tar.gz
+meshcore-stack user add petr          # vygeneruje heslo; user passwd|delete|list|totp
+meshcore-stack api on 8081            # api off
+meshcore-stack token home-assistant   # token pro další aplikaci (read/write/admin, výchozí write)
+meshcore-stack logs meshcore-server
+meshcore-stack start | stop | restart
+meshcore-stack help
 ```
+
+Noční záloha přes cron (`crontab -e`):
+
+```
+0 3 * * * /usr/local/bin/meshcore-stack backup >/dev/null 2>&1
+```
+
+Záloha obsahuje obě databáze, `.env` (včetně hesel a tokenu – soubor je čitelný jen pro vlastníka)
+a data klienta (vlastní pozadí). Pro jistotu si ji občas zkopíruj mimo počítač.
+
+## Verze
+
+`KLIENT_REF` a `SERVER_REF` v `.env` jsou ve výchozím stavu `auto` – použije se verze, kterou určuje
+aktuální stack, takže stačí `meshcore-stack update`. Pro konkrétní verzi nastav tag nebo větev
+(např. `KLIENT_REF=v1.0.4` nebo `KLIENT_REF=main`) a spusť aktualizaci; zpět na `auto` stejně.
+
+Instalace z dřívějšího `install.sh` se při první aktualizaci přepnou na `auto` a ručně přidaný
+`compose.api.yml` nahradí volba *API serveru* (port zůstane 8081).
 
 ## Co běží
 
@@ -74,15 +91,7 @@ docker compose exec -it klient-web php bin/user.php reset admin   # přihlašov�
 Data jsou v Docker svazcích `db-data`, `server-data` a `klient-data` a přežijí aktualizace i restart.
 Nastavení včetně vygenerovaných hesel a API tokenu je v `.env` (čitelný jen pro vlastníka).
 
-API serveru zpřístupníš pro další klienty odkomentováním `ports` u `meshcore-server` v `docker-compose.yml`.
-
-## Záloha
-
-```bash
-cd ~/meshcore-stack
-docker compose exec db sh -c 'mariadb-dump -uroot -p"$MARIADB_ROOT_PASSWORD" --single-transaction --databases meshcore_server meshcore_klient' > zaloha.sql
-cp .env zaloha.env
-```
+Ve složce stacku funguje i přímo `docker compose …` (soubory vybírá `COMPOSE_FILE` v `.env`).
 
 ## Poznámky
 
@@ -90,7 +99,6 @@ cp .env zaloha.env
   a notifikace v prohlížeči potřebují HTTPS – postav před stack reverse proxy s certifikátem (Caddy, Nginx Proxy
   Manager, Traefik).
 - Na internet web bez HTTPS a dalšího zabezpečení nevystavuj.
-- Odinstalace: `docker compose down -v` ve složce stacku (smaže i data!) a pak smaž složku.
 
 ## Licence
 
