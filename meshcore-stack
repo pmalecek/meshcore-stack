@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # Verze klienta a serveru pro KLIENT_REF=auto / SERVER_REF=auto (mění se s vydáním stacku)
-DEFAULT_KLIENT_REF="v1.0.6"
+DEFAULT_KLIENT_REF="v1.0.7"
 DEFAULT_SERVER_REF="v0.12.0"
 BACKUP_KEEP=3
 
